@@ -1,0 +1,1123 @@
+---
+title: "final_CE"
+author: "Daniil Rodionov"
+date: "2025-07-06"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+library(data.table)
+library(MASS)
+library(mvtnorm)
+library(MCMCpack)
+library(dplyr)
+library(cmdstanr)
+library(compositions)
+library(posterior)
+library(bayestestR)
+library(readr)
+library(zCompositions)
+library(purrr)
+library(tidyverse)
+```
+
+
+# Metrics
+
+```{r}
+evaluate_klc <- function(Y_true, Y_pred) {
+  stopifnot(all(dim(Y_true) == dim(Y_pred)))
+  if (any(Y_true <= 0) || any(Y_pred <= 0)) {
+    stop("All values in compositional matrices must be strictly positive.")
+  }
+
+  D <- ncol(Y_true)
+  klc_vals <- numeric(nrow(Y_true))
+
+  for (i in 1:nrow(Y_true)) {
+    r1 <- Y_true[i, ] / Y_pred[i, ]
+    r2 <- Y_pred[i, ] / Y_true[i, ]
+    A1 <- mean(r1)
+    A2 <- mean(r2)
+    klc_vals[i] <- (D / 2) * log(A1 * A2)
+  }
+
+  return(mean(klc_vals))
+}
+
+
+prediction_summary <- function(fit, stan_input) {
+  mu_train <- extract_prediction_matrix(
+    fit, "Y_hat",
+    ncol(stan_input$Y_train),
+    nrow(stan_input$Y_train)
+  )
+  train_eval <- evaluate_compositional_predictions(stan_input$Y_train, mu_train)
+  train_eval$set <- "train"
+
+  if (stan_input$stan_data$N_new > 0) {
+    mu_test <- extract_prediction_matrix(
+      fit, "Y_hat_pred",
+      ncol(stan_input$Y_test),
+      nrow(stan_input$Y_test)
+    )
+    test_eval <- evaluate_compositional_predictions(stan_input$Y_test, mu_test)
+    test_eval$set <- "test"
+    eval_results <- rbind(train_eval, test_eval)
+  } else {
+    eval_results <- train_eval
+  }
+
+  return(eval_results)
+}
+
+
+prediction_summary_dirichlet <- function(fit, stan_input) {
+  mu_train <- extract_prediction_matrix(
+    fit, "mu",
+    ncol(stan_input$Y_train),
+    nrow(stan_input$Y_train)
+  )
+  train_eval <- evaluate_compositional_predictions(stan_input$Y_train, mu_train)
+  train_eval$set <- "train"
+
+  if (stan_input$stan_data_dirichlet$N_new > 0) {
+    mu_test <- extract_prediction_matrix(
+      fit, "mu_pred",
+      ncol(stan_input$Y_test),
+      nrow(stan_input$Y_test)
+    )
+    test_eval <- evaluate_compositional_predictions(stan_input$Y_test, mu_test)
+    test_eval$set <- "test"
+    eval_results <- rbind(train_eval, test_eval)
+  } else {
+    eval_results <- train_eval
+  }
+
+  return(eval_results)
+}
+
+
+beta_summary <- function(fit) {
+  param_name <- "B"
+  draws_df <- as_draws_df(fit$draws(param_name))
+  summary_df <- describe_posterior(draws_df, ci = 0.95, centrality = c("mean", "median"))
+  summary_df$selected <- summary_df$pd > 0.95 & summary_df$CI_low * summary_df$CI_high > 0
+  selected_df <- summary_df[summary_df$selected, ]
+
+  extract_indices <- function(name) {
+    as.numeric(unlist(regmatches(name, gregexpr("[0-9]+", name))))
+  }
+
+  selected_df$index <- lapply(selected_df$Parameter, extract_indices)
+  selected_df$row <- sapply(selected_df$index, `[[`, 1)
+  selected_df$col <- sapply(selected_df$index, `[[`, 2)
+
+  D <- max(selected_df$row)
+  P <- max(selected_df$col)
+  beta_matrix_selected <- matrix(0, nrow = D, ncol = P)
+
+  for (i in seq_len(nrow(selected_df))) {
+    r <- selected_df$row[i]
+    c <- selected_df$col[i]
+    beta_matrix_selected[r, c] <- selected_df$Mean[i]
+  }
+
+  return(list(
+    matrix = beta_matrix_selected,
+    summary = selected_df
+  ))
+}
+
+sigma_summary <- function(fit) {
+  sigma_draws <- fit$draws("Sigma")
+  sigma_summary_df <- summarise_draws(
+    sigma_draws,
+    "mean", "sd", ~quantile(.x, probs = c(0.025, 0.975))
+  )
+
+  D <- sqrt(nrow(sigma_summary_df))
+  Sigma_mean <- matrix(sigma_summary_df$mean, nrow = D, byrow = FALSE)
+
+  return(list(
+    matrix = Sigma_mean,
+    summary = sigma_summary_df
+  ))
+}
+
+
+prepare_stan_data <- function(
+  data_location,
+  comp_columns,
+  discard_columns = c(),
+  subsample_frac = 1.0,
+  train_frac = 0.8,
+  seed = 123
+) {
+  data <- readr::read_csv(data_location)
+  
+  if (subsample_frac < 1.0) {
+    set.seed(seed)
+    data <- data[sample(nrow(data), size = floor(nrow(data) * subsample_frac)), ]
+  }
+
+  Y <- data[, comp_columns]
+  Y <- replace_zeros_if_needed(Y)
+
+  X_cols <- setdiff(colnames(data), union(comp_columns, discard_columns))
+  X <- data[, X_cols]
+  X <- cbind(Intercept = 1, X)
+
+  set.seed(seed)
+  idx_train <- sample(1:nrow(Y), size = floor(nrow(Y) * train_frac))
+  idx_test <- setdiff(1:nrow(Y), idx_train)
+
+  X_train <- X[idx_train, , drop = FALSE]
+  Y_train <- Y[idx_train, , drop = FALSE]
+  X_test  <- X[idx_test, , drop = FALSE]
+  Y_test  <- Y[idx_test, , drop = FALSE]
+
+  alr_transform <- function(Y, ref = ncol(Y)) {
+    log(Y[, -ref] / Y[, ref])
+  }
+
+  C <- ncol(Y)
+  C_eff <- C - 1
+  P <- ncol(X)
+
+  stan_data_alr <- list(
+    N = nrow(X_train),
+    D = C_eff,
+    P = P,
+    X = X_train,
+    Z = alr_transform(Y_train),
+    N_new = nrow(X_test),
+    X_new = X_test
+  )
+
+  stan_data_dirichlet <- list(
+    N = nrow(X_train),
+    D = C,
+    P = P,
+    X = X_train,
+    Y = unname(split(Y_train, seq(nrow(Y_train)))),
+    N_new = nrow(X_test),
+    X_new = X_test
+  )
+
+  return(list(
+    stan_data = stan_data_alr,
+    stan_data_dirichlet = stan_data_dirichlet,
+    Y_train = Y_train,
+    Y_test = Y_test
+  ))
+}
+
+
+
+extract_prediction_matrix <- function(fit, variable, C, N) {
+  means <- posterior::summarise_draws(fit$draws(variable), "mean")$mean
+  full_matrix <- matrix(means, ncol = C, byrow = FALSE)
+  full_matrix[1:N, ]
+}
+
+
+evaluate_compositional_predictions <- function(Y_true, Y_pred) {
+  stopifnot(nrow(Y_true) == nrow(Y_pred), ncol(Y_true) == ncol(Y_pred))
+  if (any(Y_true <= 0, na.rm = TRUE) || any(Y_pred <= 0, na.rm = TRUE)) {
+    stop("Compositional inputs must be strictly positive (no zeros or NAs).")
+  }
+
+  Y_true_acomp <- acomp(Y_true)
+  Y_pred_acomp <- acomp(Y_pred)
+
+  compute_totvar <- function(X) {
+    V <- variation(acomp(X))
+    D <- ncol(X)
+    sum(V) / (2 * D)
+  }
+
+  totvar_true <- compute_totvar(Y_true)
+  totvar_pred <- compute_totvar(Y_pred)
+  R2_T <- totvar_pred / totvar_true
+
+  dA_sq <- function(x, y) sum((clr(x) - clr(y))^2)
+  center_true <- mean(Y_true_acomp)
+
+  num <- sum(sapply(1:nrow(Y_true), function(i) dA_sq(Y_true[i, ], Y_pred[i, ])))
+  den <- sum(sapply(1:nrow(Y_true), function(i) dA_sq(Y_true[i, ], center_true)))
+  R2_A <- 1 - num / den
+
+  KLC <- evaluate_klc(Y_true, Y_pred)
+
+  return(data.frame(R2_T = R2_T, R2_A = R2_A, KLC = KLC))
+}
+
+
+compute_coverage_percent <- function(draws_df, Y_true) {
+  Y_rep_only <- draws_df[, !grepl("^\\.", names(draws_df))]
+  lower <- apply(Y_rep_only, 2, quantile, probs = 0.025, na.rm = TRUE)
+  upper <- apply(Y_rep_only, 2, quantile, probs = 0.975, na.rm = TRUE)
+  Y_true_flat <- as.vector(Y_true)
+  stopifnot(length(Y_true_flat) == length(lower))
+  coverage_mask <- !is.na(lower) & !is.na(upper)
+  covered <- (Y_true_flat[coverage_mask] >= lower[coverage_mask]) &
+             (Y_true_flat[coverage_mask] <= upper[coverage_mask])
+  mean(covered) * 100
+}
+
+
+count_nas <- function(fit, var) {
+  draws_df <- as_draws_df(fit$draws(var))
+  sum(is.na(draws_df))
+}
+
+
+replace_zeros_if_needed <- function(Y) {
+  if (any(Y == 0)) {
+    message("Replacing zeros using CZM method...")
+    return(as.matrix(cmultRepl(Y, method = "CZM", label = 0)))
+  } else {
+    return(as.matrix(Y)) 
+  }
+}
+
+```
+
+
+
+```{r}
+alr_transform <- function(Y, ref = ncol(Y)) {
+  log(Y[, -ref] / Y[, ref])
+}
+
+prepare_data_folds <- function(
+  data_location,
+  comp_columns,
+  discard_columns = c(),
+  k = 10,
+  seed = 2
+) {
+  data <- readr::read_csv(data_location)
+  Y <- replace_zeros_if_needed(data[, comp_columns])
+  X_cols <- setdiff(colnames(data), union(comp_columns, discard_columns))
+  X <- data[, X_cols]
+  X <- cbind(Intercept = 1, X)
+
+  set.seed(seed)
+  fold_ids <- sample(rep(1:k, length.out = nrow(data)))
+  folds <- vector("list", k)
+
+  for (fold in 1:k) {
+    test_idx <- which(fold_ids == fold)
+    train_idx <- setdiff(1:nrow(data), test_idx)
+
+    Y_train <- Y[train_idx, , drop = FALSE]
+    Y_test  <- Y[test_idx, , drop = FALSE]
+    X_train <- X[train_idx, , drop = FALSE]
+    X_test  <- X[test_idx, , drop = FALSE]
+
+    stan_data_alr <- list(
+      N = nrow(X_train),
+      D = ncol(Y) - 1,
+      P = ncol(X),
+      X = X_train,
+      Z = alr_transform(Y_train),
+      N_new = nrow(X_test),
+      X_new = X_test
+    )
+
+    stan_data_dirichlet <- list(
+      N = nrow(X_train),
+      D = ncol(Y),
+      P = ncol(X),
+      X = X_train,
+      Y = unname(split(Y_train, seq(nrow(Y_train)))),
+      N_new = nrow(X_test),
+      X_new = X_test
+    )
+
+    folds[[fold]] <- list(
+      fold = fold,
+      stan_data = stan_data_alr,
+      stan_data_dirichlet = stan_data_dirichlet,
+      Y_train = Y_train,
+      Y_test = Y_test
+    )
+  }
+
+  return(folds)
+}
+
+fit_dirichlet <- function(
+  data,
+  model_path,
+  output_dir,
+  seed_fit = 123,
+  iter_warmup = 500,
+  iter_sampling = 1000,
+  chains = 4,
+  parallel_chains = 4,
+  adapt_delta = 0.95,
+  max_treedepth = 18,
+  fold = 1
+) {
+  dir.create(file.path(output_dir, "dirichlet", "beta"), recursive = TRUE, showWarnings = FALSE)
+
+  model <- cmdstanr::cmdstan_model(model_path)
+  stan_data <- data$stan_data_dirichlet
+  fit <- model$sample(
+    data = stan_data,
+    seed = seed_fit,
+    chains = chains,
+    parallel_chains = parallel_chains,
+    iter_warmup = iter_warmup,
+    iter_sampling = iter_sampling,
+    adapt_delta = adapt_delta,
+    max_treedepth = max_treedepth
+  )
+
+  beta_out <- beta_summary(fit)
+  readr::write_csv(beta_out$summary, file.path(output_dir, "dirichlet", "beta", paste0("beta_fold", fold, ".csv")))
+
+  eval_results <- prediction_summary_dirichlet(fit, stan_input = data)
+  eval_results$fold <- fold
+  readr::write_csv(
+    eval_results,
+    file.path(output_dir, "dirichlet", "prediction_results.csv"),
+    append = file.exists(file.path(output_dir, "dirichlet", "prediction_results.csv"))
+  )
+
+  theta_summary <- posterior::summarise_draws(
+    fit$draws("theta"),
+    "mean", "median", "sd", ~quantile(.x, probs = c(0.025, 0.975))
+  )
+  theta_summary$fold <- fold
+  readr::write_csv(
+    theta_summary,
+    file.path(output_dir, "dirichlet", "theta_results.csv"),
+    append = file.exists(file.path(output_dir, "dirichlet", "theta_results.csv"))
+  )
+
+  return(fit)
+  rm(fit); gc()
+}
+
+fit_normal <- function(
+  data,
+  model_path,
+  output_dir,
+  seed_fit = 123,
+  iter_warmup = 500,
+  iter_sampling = 1000,
+  chains = 4,
+  parallel_chains = 4,
+  adapt_delta = 0.95,
+  max_treedepth = 18,
+  fold = 1
+) {
+  dir.create(file.path(output_dir, "normal", "beta"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(output_dir, "normal", "sigma"), showWarnings = FALSE)
+
+  model <- cmdstanr::cmdstan_model(model_path)
+  stan_data <- data$stan_data
+  fit <- model$sample(
+    data = stan_data,
+    seed = seed_fit,
+    chains = chains,
+    parallel_chains = parallel_chains,
+    iter_warmup = iter_warmup,
+    iter_sampling = iter_sampling,
+    adapt_delta = adapt_delta,
+    max_treedepth = max_treedepth
+  )
+
+  beta_out <- beta_summary(fit)
+  readr::write_csv(beta_out$summary, file.path(output_dir, "normal", "beta", paste0("beta_fold", fold, ".csv")))
+
+  eval_results <- prediction_summary(fit, stan_input = data)
+  eval_results$fold <- fold
+  readr::write_csv(eval_results, file.path(output_dir, "normal", "prediction_results.csv"),
+                   append = file.exists(file.path(output_dir, "normal", "prediction_results.csv")))
+
+  sigma_out <- sigma_summary(fit)
+  readr::write_csv(sigma_out$summary, file.path(output_dir, "normal", "sigma", paste0("sigma_fold", fold, ".csv")))
+  
+  return(fit)
+  rm(fit); gc()
+}
+
+fit_student <- function(
+  data,
+  model_path,
+  output_dir,
+  seed_fit = 2,
+  iter_warmup = 500,
+  iter_sampling = 1000,
+  chains = 4,
+  parallel_chains = 4,
+  adapt_delta = 0.95,
+  max_treedepth = 18,
+  fold = 1
+) {
+  dir.create(file.path(output_dir, "student", "beta"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(output_dir, "student", "sigma"), showWarnings = FALSE)
+
+  model <- cmdstanr::cmdstan_model(model_path)
+  stan_data <- data$stan_data
+  fit <- model$sample(
+    data = stan_data,
+    seed = seed_fit,
+    chains = chains,
+    parallel_chains = parallel_chains,
+    iter_warmup = iter_warmup,
+    iter_sampling = iter_sampling,
+    adapt_delta = adapt_delta,
+    max_treedepth = max_treedepth
+  )
+
+  beta_out <- beta_summary(fit)
+  readr::write_csv(beta_out$summary, file.path(output_dir, "student", "beta", paste0("beta_fold", fold, ".csv")))
+
+  eval_results <- prediction_summary(fit, stan_input = data)
+  eval_results$fold <- fold
+  readr::write_csv(eval_results, file.path(output_dir, "student", "prediction_results.csv"),
+                   append = file.exists(file.path(output_dir, "student", "prediction_results.csv")))
+
+  sigma_out <- sigma_summary(fit)
+  readr::write_csv(sigma_out$summary, file.path(output_dir, "student", "sigma", paste0("sigma_fold", fold, ".csv")))
+
+  nu_summary <- posterior::summarise_draws(
+    fit$draws("nu"),
+    "mean", "median", "sd", ~quantile(.x, probs = c(0.025, 0.975))
+  )
+  nu_summary$fold <- fold
+  readr::write_csv(nu_summary, file.path(output_dir, "student", "nu_results.csv"),
+                   append = file.exists(file.path(output_dir, "student", "nu_results.csv")))
+  
+  return(fit)
+  rm(fit); gc()
+}
+
+run_all_models_kfold <- function(
+  data_location,
+  comp_columns,
+  discard_columns = c(),
+  output_dir = "real_results",
+  k = 10,
+  seed = 123,
+  model_paths = list(
+    normal = "ALR_normal_regularized_horseshoe.stan",
+    student = "ALR_student_regularized_horseshoe.stan",
+    dirichlet = "dirichlet_horseshoe.stan"
+  ),
+  iter_warmup = 500,
+  iter_sampling = 1000,
+  chains = 4,
+  parallel_chains = 4,
+  adapt_delta = 0.95,
+  max_treedepth = 18,
+  seed_fit = 123
+) {
+  folds <- prepare_data_folds(data_location, comp_columns, discard_columns, k, seed)
+  
+  for (fold in folds) {
+    fold_id <- fold$fold
+    message("Running fold ", fold_id)
+
+    fit_normal(
+      data = fold,
+      model_path = model_paths$normal,
+      output_dir = output_dir,
+      seed_fit = seed_fit,
+      iter_warmup = iter_warmup,
+      iter_sampling = iter_sampling,
+      chains = chains,
+      parallel_chains = parallel_chains,
+      adapt_delta = adapt_delta,
+      max_treedepth = max_treedepth,
+      fold = fold_id
+    )
+
+    fit_student(
+      data = fold,
+      model_path = model_paths$student,
+      output_dir = output_dir,
+      seed_fit = seed_fit,
+      iter_warmup = iter_warmup,
+      iter_sampling = iter_sampling,
+      chains = chains,
+      parallel_chains = parallel_chains,
+      adapt_delta = adapt_delta,
+      max_treedepth = max_treedepth,
+      fold = fold_id
+    )
+
+    fit_dirichlet(
+      data = fold,
+      model_path = model_paths$dirichlet,
+      output_dir = output_dir,
+      seed_fit = seed_fit,
+      iter_warmup = iter_warmup,
+      iter_sampling = iter_sampling,
+      chains = chains,
+      parallel_chains = parallel_chains,
+      adapt_delta = adapt_delta,
+      max_treedepth = max_treedepth,
+      fold = fold_id
+    )
+  }
+}
+```
+
+# Runs
+
+```{r}
+run_all_models_kfold(
+  data_location = "data/final_dataset.csv",
+  comp_columns = c("FOOD", "OTHER", "HEALTH", "HOUSING"),
+  discard_columns = c("NEWID"),
+  output_dir = "real_results",
+  k = 10,
+  seed = 2,
+  model_paths = list(
+    normal = "ALR_normal_regularized_horseshoe.stan",
+    student = "ALR_student_regularized_horseshoe.stan",
+    dirichlet = "dirichlet_horseshoe.stan"
+  ),
+  iter_warmup = 500,
+  iter_sampling = 2000,
+  chains = 4,
+  parallel_chains = 4,
+  adapt_delta = 0.95,
+  max_treedepth = 18,
+  seed_fit = 2
+)
+
+```
+
+
+```{r}
+run_all_models_full <- function(
+  data_location,
+  comp_columns,
+  discard_columns = c(),
+  output_dir = "results_full",
+  seed = 2,
+  model_paths = list(
+    normal = "ALR_normal_regularized_horseshoe.stan",
+    student = "ALR_student_regularized_horseshoe.stan",
+    dirichlet = "dirichlet_horseshoe.stan"
+  ),
+  iter_warmup = 500,
+  iter_sampling = 2000,
+  chains = 4,
+  parallel_chains = 4,
+  adapt_delta = 0.95,
+  max_treedepth = 18,
+  seed_fit = 2
+) {
+ 
+  data <- readr::read_csv(data_location)
+  Y <- replace_zeros_if_needed(data[, comp_columns])
+  X_cols <- setdiff(colnames(data), union(comp_columns, discard_columns))
+  X <- data[, X_cols]
+  X <- cbind(Intercept = 1, X)
+
+  stan_data_alr <- list(
+    N = nrow(X),
+    D = ncol(Y) - 1,
+    P = ncol(X),
+    X = X,
+    Z = log(Y[, -ncol(Y)] / Y[, ncol(Y)]),
+    N_new = 0,
+    X_new = matrix(0, 0, ncol(X))
+  )
+
+  stan_data_dirichlet <- list(
+    N = nrow(X),
+    D = ncol(Y),
+    P = ncol(X),
+    X = X,
+    Y = unname(split(Y, seq(nrow(Y)))),
+    N_new = 0,
+    X_new = matrix(0, 0, ncol(X))
+  )
+
+  data_bundle <- list(
+    stan_data = stan_data_alr,
+    stan_data_dirichlet = stan_data_dirichlet,
+    Y_train = Y,
+    Y_test = Y 
+  )
+
+  fit_normal <- fit_normal(
+    data = data_bundle,
+    model_path = model_paths$normal,
+    output_dir = output_dir,
+    seed_fit = seed_fit,
+    iter_warmup = iter_warmup,
+    iter_sampling = iter_sampling,
+    chains = chains,
+    parallel_chains = parallel_chains,
+    adapt_delta = adapt_delta,
+    max_treedepth = max_treedepth,
+    fold = 0
+  )
+
+  fit_student <- fit_student(
+    data = data_bundle,
+    model_path = model_paths$student,
+    output_dir = output_dir,
+    seed_fit = seed_fit,
+    iter_warmup = iter_warmup,
+    iter_sampling = iter_sampling,
+    chains = chains,
+    parallel_chains = parallel_chains,
+    adapt_delta = adapt_delta,
+    max_treedepth = max_treedepth,
+    fold = 0
+  )
+
+  fit_dirichlet <- fit_dirichlet(
+    data = data_bundle,
+    model_path = model_paths$dirichlet,
+    output_dir = output_dir,
+    seed_fit = seed_fit,
+    iter_warmup = iter_warmup,
+    iter_sampling = iter_sampling,
+    chains = chains,
+    parallel_chains = parallel_chains,
+    adapt_delta = adapt_delta,
+    max_treedepth = max_treedepth,
+    fold = 0
+  )
+
+  return(list(
+    normal = fit_normal,
+    student = fit_student,
+    dirichlet = fit_dirichlet
+  ))
+}
+
+```
+
+```{r}
+fits <- run_all_models_full(
+  data_location = "data/final_dataset.csv",
+  comp_columns = c("FOOD", "OTHER", "HEALTH", "HOUSING"),
+  discard_columns = c("NEWID"),
+  output_dir = "results_full",
+  seed = 2,
+  model_paths = list(
+    normal = "ALR_normal_regularized_horseshoe.stan",
+    student = "ALR_student_regularized_horseshoe.stan",
+    dirichlet = "dirichlet_horseshoe.stan"
+  ),
+  iter_warmup = 500,
+  iter_sampling = 2000,
+  chains = 4,
+  parallel_chains = 4,
+  adapt_delta = 0.95,
+  max_treedepth = 18,
+  seed_fit = 2
+)
+
+```
+
+
+# Data aggregation
+
+```{r}
+aggregate_beta_folds <- function(
+  beta_dir,
+  output_file = NULL,
+  total_folds = 10,
+  keep_median = FALSE
+) {
+  beta_files <- list.files(beta_dir, pattern = "^beta_fold[0-9]+\\.csv$", full.names = TRUE)
+  
+  if (length(beta_files) == 0) {
+    stop("No beta_fold CSVs found in the specified directory.")
+  }
+
+  beta_data <- purrr::map_dfr(beta_files, readr::read_csv, .id = "source")
+
+  selected <- subset(beta_data, selected == TRUE)
+
+  selected <- selected[, !(names(selected) %in% c("ROPE_CI", "ROPE_low", "ROPE_high", "pd"))]
+
+  summary <- selected |>
+    dplyr::group_by(Parameter, row, col) |>
+    dplyr::summarise(
+      mean_mean = mean(Mean),
+      n_selected_folds = dplyr::n(),
+      selection_freq = n_selected_folds / total_folds,
+      mean_median = if (keep_median) mean(Median) else NULL,
+      .groups = "drop"
+    )
+
+  if (!is.null(output_file)) {
+    readr::write_csv(summary, output_file)
+  }
+
+  return(summary)
+}
+
+```
+
+```{r}
+normal_beta_summary <- aggregate_beta_folds(
+  beta_dir = "real_results/normal/beta",
+  output_file = "real_results/normal/normal_beta_summary.csv",
+  total_folds = 10,
+  keep_median = FALSE
+)
+
+```
+```{r}
+annotate_beta_summary <- function(beta_summary_df, 
+                                  data_path, 
+                                  comp_columns, 
+                                  discard_columns = c()) {
+  data <- readr::read_csv(data_path, show_col_types = FALSE)
+
+  predictor_names <- setdiff(colnames(data), union(comp_columns, discard_columns))
+
+  predictor_names <- c("Intercept", predictor_names)
+
+  component_names <- comp_columns[1:(length(comp_columns) - 1)]
+
+
+  beta_summary_df$variable <- predictor_names[beta_summary_df$col]
+  beta_summary_df$component <- component_names[beta_summary_df$row]
+  beta_summary_df <- beta_summary_df[, c("Parameter", "row", "col", "variable", "component", 
+                                         setdiff(names(beta_summary_df), c("Parameter", "row", "col", "variable", "component")))]
+
+  return(beta_summary_df)
+}
+
+```
+
+
+```{r}
+normal_beta_summary <- aggregate_beta_folds(
+  beta_dir = "real_results/normal/beta",
+  output_file = "real_results/normal/normal_beta_summary.csv",
+  total_folds = 10,
+  keep_median = FALSE
+)
+
+student_beta_summary <- aggregate_beta_folds(
+  beta_dir = "real_results/student/beta",
+  output_file = "real_results/student/student_beta_summary.csv",
+  total_folds = 10,
+  keep_median = FALSE
+)
+
+dirichlet_beta_summary <- aggregate_beta_folds(
+  beta_dir = "real_results/dirichlet/beta",
+  output_file = "real_results/dirichlet/dirichlet_beta_summary.csv",
+  total_folds = 10,
+  keep_median = FALSE
+)
+
+normal_beta_summary_annotated <- annotate_beta_summary(
+  beta_summary_df = normal_beta_summary,
+  data_path = "data/final_dataset.csv",
+  comp_columns = c("FOOD", "OTHER", "HEALTH", "HOUSING"),
+  discard_columns = c("NEWID")
+)
+
+student_beta_summary_annotated <- annotate_beta_summary(
+  beta_summary_df = student_beta_summary,
+  data_path = "data/final_dataset.csv",
+  comp_columns = c("FOOD", "OTHER", "HEALTH", "HOUSING"),
+  discard_columns = c("NEWID")
+)
+
+dirichlet_beta_summary_annotated <- annotate_beta_summary(
+  beta_summary_df = dirichlet_beta_summary,
+  data_path = "data/final_dataset.csv",
+  comp_columns = c("FOOD", "OTHER", "HEALTH", "HOUSING"),
+  discard_columns = c("NEWID")
+)
+
+readr::write_csv(normal_beta_summary_annotated, "real_results/normal/normal_beta_summary_annotated.csv")
+readr::write_csv(student_beta_summary_annotated, "real_results/student/student_beta_summary_annotated.csv")
+readr::write_csv(dirichlet_beta_summary_annotated, "real_results/dirichlet/dirichlet_beta_summary_annotated.csv")
+
+```
+
+```{r}
+aggregate_sigma_means <- function(sigma_dir, output_file) {
+  sigma_files <- list.files(sigma_dir, pattern = "^sigma_fold.*\\.csv$", full.names = TRUE)
+
+  all_sigma <- sigma_files %>%
+    map_dfr(read_csv, show_col_types = FALSE)
+
+  summary_sigma <- all_sigma %>%
+    group_by(variable) %>%
+    summarise(mean = mean(mean, na.rm = TRUE), .groups = "drop")
+
+  readr::write_csv(summary_sigma, output_file)
+  return(summary_sigma)
+}
+
+normal_sigma_summary <- aggregate_sigma_means(
+  sigma_dir = "real_results/normal/sigma",
+  output_file = "real_results/normal/normal_sigma_summary.csv"
+)
+
+student_sigma_summary <- aggregate_sigma_means(
+  sigma_dir = "real_results/student/sigma",
+  output_file = "real_results/student/student_sigma_summary.csv"
+)
+
+```
+
+```{r}
+aggregate_prediction_results <- function(pred_file, output_file) {
+  df <- read_csv(pred_file, show_col_types = FALSE)
+
+  summary <- df %>%
+    group_by(set) %>%
+    summarise(
+      R2_T = mean(R2_T, na.rm = TRUE),
+      R2_A = mean(R2_A, na.rm = TRUE),
+      KLC = mean(KLC, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  write_csv(summary, output_file)
+  return(summary)
+}
+
+normal_prediction_summary <- aggregate_prediction_results(
+  pred_file = "real_results/normal/prediction_results.csv",
+  output_file = "real_results/normal/normal_prediction_summary.csv"
+)
+
+student_prediction_summary <- aggregate_prediction_results(
+  pred_file = "real_results/student/prediction_results.csv",
+  output_file = "real_results/student/student_prediction_summary.csv"
+)
+
+dirichlet_prediction_summary <- aggregate_prediction_results(
+  pred_file = "real_results/dirichlet/prediction_results.csv",
+  output_file = "real_results/dirichlet/dirichlet_prediction_summary.csv"
+)
+
+
+theta_df <- read_csv("real_results/dirichlet/theta_results.csv")
+
+theta_summary <- theta_df %>%
+  group_by(variable) %>%
+  summarise(mean_theta = mean(mean), .groups = "drop")
+
+write_csv(theta_summary, "real_results/dirichlet/theta_summary.csv")
+
+nu_df <- read_csv("real_results/student/nu_results.csv")
+
+nu_summary <- nu_df %>%
+  group_by(variable) %>%
+  summarise(mean_nu = mean(mean), .groups = "drop")
+
+write_csv(nu_summary, "real_results/student/nu_summary.csv")
+
+```
+
+
+```{r}
+normal_summary <- read_csv("real_results/normal/normal_prediction_summary.csv")
+student_summary <- read_csv("real_results/student/student_prediction_summary.csv")
+dirichlet_summary <- read_csv("real_results/dirichlet/dirichlet_prediction_summary.csv")
+```
+```{r}
+normal_beta <- read_csv("real_results/normal/normal_beta_summary_annotated.csv")
+student_beta <- read_csv("real_results/student/student_beta_summary_annotated.csv")
+dirichlet_beta <- read_csv("real_results/dirichlet/dirichlet_beta_summary_annotated.csv")
+```
+```{r}
+student_sigma <- read_csv("real_results/student/student_sigma_summary.csv")
+normal_sigma <- read_csv("real_results/normal/normal_sigma_summary.csv")
+
+```
+```{r}
+normal_full_beta = read_csv("C:/DS/Thesis/results_full/normal/beta/beta_fold0.csv")
+```
+```{r}
+gg <- annotate_beta_summary(
+  beta_summary_df = normal_full_beta,
+  data_path = "data/final_dataset.csv",
+  comp_columns = c("FOOD", "OTHER", "HEALTH", "HOUSING"),
+  discard_columns = c("NEWID")
+)
+```
+
+```{r}
+comp_columns <- c("FOOD", "OTHER", "HEALTH", "HOUSING")
+
+normal_full_beta_summary <- annotate_beta_summary(
+  beta_summary_df = read_csv("C:/DS/Thesis/results_full/normal/beta/beta_fold0.csv"),
+  data_path = "data/final_dataset.csv",
+  comp_columns = comp_columns,
+  discard_columns = c("NEWID")
+) %>%
+  select(-c(Parameter, row, col, Median, CI, pd, ROPE_CI, ROPE_low, ROPE_high, ROPE_Percentage, selected, index)) %>%
+  mutate(component = factor(component, levels = comp_columns)) %>%
+  arrange(component)
+
+write_csv(normal_full_beta_summary, "C:/DS/Thesis/results_full/normal/beta/normal_full_beta_summary.csv")
+
+student_full_beta_summary <- annotate_beta_summary(
+  beta_summary_df = read_csv("C:/DS/Thesis/results_full/student/beta/beta_fold0.csv"),
+  data_path = "data/final_dataset.csv",
+  comp_columns = comp_columns,
+  discard_columns = c("NEWID")
+) %>%
+  select(-c(Parameter, row, col, Median, CI, pd, ROPE_CI, ROPE_low, ROPE_high, ROPE_Percentage, selected, index)) %>%
+  mutate(component = factor(component, levels = comp_columns)) %>%
+  arrange(component)
+
+write_csv(student_full_beta_summary, "C:/DS/Thesis/results_full/student/beta/student_full_beta_summary.csv")
+
+dirichlet_full_beta_summary <- annotate_beta_summary(
+  beta_summary_df = read_csv("C:/DS/Thesis/results_full/dirichlet/beta/beta_fold0.csv"),
+  data_path = "data/final_dataset.csv",
+  comp_columns = comp_columns,
+  discard_columns = c("NEWID")
+) %>%
+  select(-c(Parameter, row, col, Median, CI, pd, ROPE_CI, ROPE_low, ROPE_high, ROPE_Percentage, selected, index)) %>%
+  mutate(component = factor(component, levels = comp_columns)) %>%
+  arrange(component)
+
+write_csv(dirichlet_full_beta_summary, "C:/DS/Thesis/results_full/dirichlet/beta/dirichlet_full_beta_summary.csv")
+
+
+```
+
+```{r}
+normal <- read_csv("C:/DS/Thesis/results_full/normal/beta/normal_full_beta_summary.csv")
+student <- read_csv("C:/DS/Thesis/results_full/student/beta/student_full_beta_summary.csv")
+dirichlet <- read_csv("C:/DS/Thesis/results_full/dirichlet/beta/dirichlet_full_beta_summary.csv")
+
+prepare_model <- function(df, model_name) {
+  df %>%
+    mutate(sign = case_when(
+      Mean > 0 ~ 1,
+      Mean < 0 ~ -1,
+      TRUE ~ 0
+    )) %>%
+    select(variable, component, sign) %>%
+    rename(!!paste0("sign_", model_name) := sign)
+}
+
+normal_s <- prepare_model(normal, "normal")
+student_s <- prepare_model(student, "student")
+dirichlet_s <- prepare_model(dirichlet, "dirichlet")
+
+votes_table_signed <- full_join(normal_s, student_s, by = c("variable", "component")) %>%
+  full_join(dirichlet_s, by = c("variable", "component")) %>%
+  replace_na(list(
+    sign_normal = 0,
+    sign_student = 0,
+    sign_dirichlet = 0
+  ))
+
+print(votes_table_signed)
+write_csv(votes_table_signed, "C:/DS/Thesis/results_full/votes_table_signed.csv")
+
+```
+```{r}
+unanimous_signed <- votes_table_signed %>%
+  filter(sign_normal != 0,
+         sign_student != 0,
+         sign_dirichlet != 0,
+         sign_normal == sign_student,
+         sign_student == sign_dirichlet)
+
+print(unanimous_signed)
+write_csv(unanimous_signed, "C:/DS/Thesis/results_full/unanimous_votes_table_signed.csv")
+
+```
+
+# Convergence
+
+```{r}
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(cowplot)
+
+draws_student <- as_draws_df(fits$student$draws(variables = c("nu", "B[1,1]", "B[2,1]")))
+draws_dirichlet <- as_draws_df(fits$dirichlet$draws(variables = c("theta", "B[1,1]", "B[2,1]")))
+draws_normal <- as_draws_df(fits$normal$draws(variables = c("B[1,1]", "B[2,1]", "B[3,1]")))
+
+names(draws_student)[names(draws_student) == "nu"] <- "nu"
+names(draws_student)[names(draws_student) == "B[1,1]"] <- "beta[1,1]"
+names(draws_student)[names(draws_student) == "B[2,1]"] <- "beta[2,1]"
+
+names(draws_dirichlet)[names(draws_dirichlet) == "theta"] <- "theta"
+names(draws_dirichlet)[names(draws_dirichlet) == "B[1,1]"] <- "beta[1,1]"
+names(draws_dirichlet)[names(draws_dirichlet) == "B[2,1]"] <- "beta[2,1]"
+
+names(draws_normal)[names(draws_normal) == "B[1,1]"] <- "beta[1,1]"
+names(draws_normal)[names(draws_normal) == "B[2,1]"] <- "beta[2,1]"
+names(draws_normal)[names(draws_normal) == "B[3,1]"] <- "beta[3,1]"
+
+plot_student <- mcmc_trace(draws_student, pars = c("nu", "beta[1,1]", "beta[2,1]")) +
+  ggtitle("Student-t")
+
+plot_dirichlet <- mcmc_trace(draws_dirichlet, pars = c("theta", "beta[1,1]", "beta[2,1]")) +
+  ggtitle("Dirichlet")
+
+plot_normal <- mcmc_trace(draws_normal, pars = c("beta[1,1]", "beta[2,1]", "beta[3,1]")) +
+  ggtitle("Normal")
+
+final_plot <- plot_grid(plot_student, plot_dirichlet, plot_normal,
+                        ncol = 1, labels = c("A", "B", "C"))
+
+ggsave("appendix_trace_plots.pdf", final_plot, width = 10, height = 12)
+
+
+```
+
+
+```{r}
+final_plot  
+
+```
+```{r}
+params_student <- c("nu", "B[1,1]", "B[2,1]")
+params_dirichlet <- c("theta", "B[1,1]", "B[2,1]")
+params_normal <- c("B[1,1]", "B[2,1]", "B[3,1]")
+
+
+diag_student <- summarise_draws(fits$student$draws(variables = params_student)) %>%
+  mutate(model = "Student-t")
+diag_dirichlet <- summarise_draws(fits$dirichlet$draws(variables = params_dirichlet)) %>%
+  mutate(model = "Dirichlet")
+diag_normal <- summarise_draws(fits$normal$draws(variables = params_normal)) %>%
+  mutate(model = "Normal")
+
+
+diag_table <- bind_rows(diag_student, diag_dirichlet, diag_normal) %>%
+  select(model, variable, rhat, ess_bulk, ess_tail)
+
+
+diag_table_pretty <- diag_table %>%
+  mutate(across(c(rhat, ess_bulk, ess_tail), ~ round(.x, 2))) %>%
+  rename(
+    `Model` = model,
+    `Parameter` = variable,
+    `R̂` = rhat,
+    `ESS (Bulk)` = ess_bulk,
+    `ESS (Tail)` = ess_tail
+  )
+
+
+print(diag_table_pretty)
+
+```
+

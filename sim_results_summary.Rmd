@@ -1,0 +1,238 @@
+---
+title: "Untitled"
+author: "Daniil Rodionov"
+date: "2025-06-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(readr)
+
+# Path to results directory
+results_path <- "C:/DS/Thesis/simul_res/results_cluster_25"
+
+# Load each result table
+beta_results <- read_csv(file.path(results_path, "beta_results.csv"))
+beta_true    <- read_csv(file.path(results_path, "beta_true.csv"))
+nu_results   <- read_csv(file.path(results_path, "nu_results.csv"))
+sigma_results <- read_csv(file.path(results_path, "sigma_results.csv"))
+prediction_results <- read_csv(file.path(results_path, "prediction_results.csv"))
+```
+
+```{r}
+summarize_simulation_results <- function(results_path) {
+  beta_results <- readr::read_csv(file.path(results_path, "beta_results.csv"))
+  beta_true    <- readr::read_csv(file.path(results_path, "beta_true.csv"))
+  nu_results   <- readr::read_csv(file.path(results_path, "nu_results.csv"))
+  sigma_results <- readr::read_csv(file.path(results_path, "sigma_results.csv"))
+  prediction_results <- readr::read_csv(file.path(results_path, "prediction_results.csv"))
+
+  prediction_summary <- prediction_results |>
+    dplyr::group_by(model, set) |>
+    dplyr::summarise(
+      R2_T = mean(R2_T, na.rm = TRUE),
+      R2_A = mean(R2_A, na.rm = TRUE),
+      KLC = mean(KLC, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  sigma_summary <- sigma_results |>
+    dplyr::group_by(model) |>
+    dplyr::summarise(
+      frobenius_error = mean(frobenius_error, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  nu_summary <- nu_results |>
+    dplyr::summarise(
+      mean_nu = mean(mean, na.rm = TRUE),
+      bias = mean(mean - true_value, na.rm = TRUE),
+      coverage = mean(true_value >= `2.5%` & true_value <= `97.5%`, na.rm = TRUE)
+    ) |>
+    dplyr::mutate(model = "student")
+
+  beta_summary <- beta_results |>
+    dplyr::group_by(model) |>
+    dplyr::summarise(dplyr::across(-sim, mean, na.rm = TRUE), .groups = "drop")
+
+  return(list(
+    beta_true = beta_true,
+    prediction_summary = prediction_summary,
+    sigma_summary = sigma_summary,
+    nu_summary = nu_summary,
+    beta_summary = beta_summary
+  ))
+}
+
+
+```
+
+```{r}
+results_path <- "C:/DS/Thesis/simul_res/results_cluster_5"
+
+summary_output <- summarize_simulation_results(results_path)
+print(summary_output$beta_true)
+print(summary_output$prediction_summary)
+print(summary_output$sigma_summary)
+print(summary_output$nu_summary)
+print(summary_output$beta_summary)
+
+```
+```{r}
+
+# Path to results directory
+results_path <- "C:/DS/Thesis/simul_res/results_4_cluster_dirichlet_100"
+
+# Load each result table
+beta_results       <- read_csv(file.path(results_path, "beta_results.csv"))
+beta_true          <- read_csv(file.path(results_path, "beta_true.csv"))
+theta_results      <- read_csv(file.path(results_path, "theta_results.csv"))
+prediction_results <- read_csv(file.path(results_path, "prediction_results.csv"))
+```
+```{r}
+summarize_simulation_results_dirichlet <- function(results_path) {
+  beta_results       <- readr::read_csv(file.path(results_path, "beta_results.csv"))
+  beta_true          <- readr::read_csv(file.path(results_path, "beta_true.csv"))
+  theta_results      <- readr::read_csv(file.path(results_path, "theta_results.csv"))
+  prediction_results <- readr::read_csv(file.path(results_path, "prediction_results.csv"))
+
+  prediction_summary <- prediction_results |>
+    dplyr::group_by(model, set) |>
+    dplyr::summarise(
+      R2_T = mean(R2_T, na.rm = TRUE),
+      R2_A = mean(R2_A, na.rm = TRUE),
+      KLC = mean(KLC, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  theta_summary <- theta_results |>
+    dplyr::summarise(
+      mean_theta = mean(mean, na.rm = TRUE),
+      bias = mean(mean - true_value, na.rm = TRUE),
+      coverage = mean(true_value >= `2.5%` & true_value <= `97.5%`, na.rm = TRUE)
+    ) |>
+    dplyr::mutate(model = "dirichlet")
+
+  beta_summary <- beta_results |>
+    dplyr::group_by(model) |>
+    dplyr::summarise(dplyr::across(-sim, mean, na.rm = TRUE), .groups = "drop")
+
+  return(list(
+    beta_true = beta_true,
+    prediction_summary = prediction_summary,
+    theta_summary = theta_summary,
+    beta_summary = beta_summary
+  ))
+}
+
+```
+
+```{r}
+results_dirichlet <- summarize_simulation_results_dirichlet("C:/DS/Thesis/simul_res/results_4_cluster_dirichlet_150")
+print(results_dirichlet$beta_true)
+print(results_dirichlet$prediction_summary)
+print(results_dirichlet$theta_summary)
+print(results_dirichlet$beta_summary)
+
+```
+```{r}
+results_dirichlet <- summarize_simulation_results_dirichlet("C:/DS/Thesis/simul_res/results_4_cluster_dirichlet_100")
+print(results_dirichlet$beta_true)
+print(results_dirichlet$prediction_summary)
+print(results_dirichlet$theta_summary)
+print(results_dirichlet$beta_summary)
+```
+
+# Actual summaries
+
+```{r}
+# Define base path
+base_path <- "C:/DS/Thesis/simul_res"
+
+# Summarize prediction results for ν = 25
+summary_25 <- summarize_simulation_results(file.path(base_path, "results_cluster_25"))
+pred_25 <- summary_25$prediction_summary
+
+# Summarize prediction results for ν = 5
+summary_5 <- summarize_simulation_results(file.path(base_path, "results_cluster_5"))
+pred_5 <- summary_5$prediction_summary
+
+# Summarize prediction results for ν = 2.5
+summary_2_5 <- summarize_simulation_results(file.path(base_path, "results_cluster_2_5"))
+pred_2_5 <- summary_2_5$prediction_summary
+
+
+model_order <- c("normal", "student", "dirichlet")
+set_order <- c("train", "test")
+
+pred_25 <- pred_25 |>
+  dplyr::mutate(
+    model = factor(model, levels = model_order),
+    set = factor(set, levels = set_order)
+  ) |>
+  dplyr::arrange(model, set)
+
+pred_5 <- pred_5 |>
+  dplyr::mutate(
+    model = factor(model, levels = model_order),
+    set = factor(set, levels = set_order)
+  ) |>
+  dplyr::arrange(model, set)
+
+pred_2_5 <- pred_2_5 |>
+  dplyr::mutate(
+    model = factor(model, levels = model_order),
+    set = factor(set, levels = set_order)
+  ) |>
+  dplyr::arrange(model, set)
+
+readr::write_csv(pred_25, "C:/DS/Thesis/summaries/pred_summary_25.csv")
+readr::write_csv(pred_5, "C:/DS/Thesis/summaries/pred_summary_5.csv")
+readr::write_csv(pred_2_5, "C:/DS/Thesis/summaries/pred_summary_2_5.csv")
+
+
+```
+
+
+```{r}
+base_path <- "C:/DS/Thesis/simul_res"
+
+summary_250 <- summarize_simulation_results_dirichlet(file.path(base_path, "results_4_cluster_dirichlet_250"))
+pred_250 <- summary_250$prediction_summary
+
+summary_100 <- summarize_simulation_results_dirichlet(file.path(base_path, "results_4_cluster_dirichlet_100"))
+pred_100 <- summary_100$prediction_summary
+
+summary_35 <- summarize_simulation_results_dirichlet(file.path(base_path, "results_4_cluster_dirichlet_35"))
+pred_35 <- summary_35$prediction_summary
+
+model_order <- c("normal", "student", "dirichlet")
+set_order <- c("train", "test")
+
+pred_250 <- pred_250 |>
+  dplyr::mutate(
+    model = factor(model, levels = model_order),
+    set = factor(set, levels = set_order)
+  ) |>
+  dplyr::arrange(model, set)
+
+pred_100 <- pred_100 |>
+  dplyr::mutate(
+    model = factor(model, levels = model_order),
+    set = factor(set, levels = set_order)
+  ) |>
+  dplyr::arrange(model, set)
+
+pred_35 <- pred_35 |>
+  dplyr::mutate(
+    model = factor(model, levels = model_order),
+    set = factor(set, levels = set_order)
+  ) |>
+  dplyr::arrange(model, set)
+
+readr::write_csv(pred_250, "C:/DS/Thesis/summaries/pred_dirichlet_250.csv")
+readr::write_csv(pred_100, "C:/DS/Thesis/summaries/pred_dirichlet_100.csv")
+readr::write_csv(pred_35, "C:/DS/Thesis/summaries/pred_dirichlet_35.csv")
+
+```
+
